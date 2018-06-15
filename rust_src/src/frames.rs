@@ -3,16 +3,18 @@
 use libc::c_int;
 
 use remacs_macros::lisp_fn;
-use remacs_sys::{selected_frame as current_frame, BoolBF, EmacsInt, Lisp_Frame, Lisp_Type};
+use remacs_sys::{get_frame_param, selected_frame as current_frame, BoolBF, EmacsInt, Lisp_Frame,
+                 Lisp_Type, Vframe_list};
 use remacs_sys::{fget_column_width, fget_iconified, fget_internal_border_width, fget_left_pos,
                  fget_line_height, fget_minibuffer_window, fget_output_method,
                  fget_pointer_invisible, fget_root_window, fget_selected_window, fget_terminal,
                  fget_top_pos, fget_visible, frame_dimension, fset_selected_window, Fcons,
                  Fselect_window};
-use remacs_sys::{Qframe_live_p, Qframep, Qicon, Qns, Qpc, Qt, Qw32, Qx};
+use remacs_sys::{Qframe_live_p, Qframep, Qicon, Qno_other_frame, Qns, Qpc, Qt, Qvisible, Qw32, Qx};
 
-use lisp::{ExternalPtr, LispObject};
+use lisp::{CarIter, ExternalPtr, LispObject};
 use lisp::defsubr;
+use terminal::{DisplayInfo, DisplayType, Terminal};
 use windows::{selected_window, LispWindowRef};
 
 pub type OutputMethod = c_int;
@@ -24,6 +26,27 @@ pub const output_msdos_raw: OutputMethod = 4;
 pub const output_ns: OutputMethod = 5;
 
 pub type LispFrameRef = ExternalPtr<Lisp_Frame>;
+
+#[derive(PartialEq)]
+enum FrameType {
+    Termcap,
+    X,
+    W32,
+    MsDosRaw,
+    None,
+}
+
+impl From<LispFrameRef> for FrameType {
+    fn from(frame: LispFrameRef) -> FrameType {
+        match unsafe { fget_output_method(frame.as_ptr()) } {
+            output_initial | output_termcap => FrameType::Termcap,
+            output_x_window => FrameType::X,
+            output_w32 => FrameType::W32,
+            output_msdos_raw => FrameType::MsDosRaw,
+            _ => FrameType::None,
+        }
+    }
+}
 
 impl LispFrameRef {
     pub fn as_lisp_obj(self) -> LispObject {
@@ -38,6 +61,12 @@ impl LispFrameRef {
     #[inline]
     pub fn column_width(self) -> i32 {
         unsafe { fget_column_width(self.as_ptr()) }
+    }
+
+    /// port of `FRAME_FOCUS_FRAME`
+    #[inline]
+    pub fn focus_frame(self) -> LispObject {
+        unsafe { (*self.as_ptr()).focus_frame }
     }
 
     // Pixel-width of internal border lines.
@@ -82,6 +111,32 @@ impl LispFrameRef {
     }
 
     #[inline]
+    pub fn terminal(&self) -> Terminal {
+        unsafe { Terminal::new(fget_terminal(self.as_ptr())) }
+    }
+
+    /// Return `DisplayInfo' about SELF if SELF is a TTY or MSDOS raw display,
+    ///
+    /// Port of `FRAME_TTY' in `termchar.h'.
+    #[inline]
+    pub fn tty(&self) -> Option<DisplayInfo> {
+        match FrameType::from(self.clone()) {
+            FrameType::Termcap | FrameType::MsDosRaw => {
+                Some(self.terminal().display_info(DisplayType::Tty))
+            }
+            _ => return None,
+        }
+    }
+
+    /// Returns `true' if SELF is a minibuffer-only frame.
+    ///
+    /// Port of `FRAME_MINIBUF_ONLY_P'
+    #[inline]
+    pub fn is_minibuffer_only(self) -> bool {
+        return self.root_window() == self.minibuffer_window();
+    }
+
+    #[inline]
     pub fn is_visible(self) -> bool {
         unsafe { fget_visible(self.as_ptr()) }
     }
@@ -94,6 +149,13 @@ impl LispFrameRef {
     #[inline]
     pub fn pointer_invisible(self) -> bool {
         unsafe { fget_pointer_invisible(self.as_ptr()) }
+    }
+}
+
+impl Default for LispFrameRef {
+    #[inline]
+    fn default() -> LispFrameRef {
+        return selected_frame().as_frame_or_error();
     }
 }
 
@@ -307,6 +369,137 @@ pub fn frame_position(frame: LispObject) -> LispObject {
 pub fn frame_pointer_visible_p(frame: LispObject) -> bool {
     let frame_ref = frame_or_selected(frame);
     !frame_ref.pointer_invisible()
+}
+
+/// Return the next frame in the frame list after FRAME.
+/// By default, skip minibuffer-only frames.
+/// If omitted, FRAME defaults to the selected frame.
+/// If optional argument MINIFRAME is nil, exclude minibuffer-only frames.
+/// If MINIFRAME is a window, include only its own frame
+/// and frame now using that window as the minibuffer.
+/// If MINIFRAME is `visible', include all visible frames.
+/// If MINIFRAME is 0, include all visible and iconified frames.
+/// Otherwise, include all frames.
+#[lisp_fn(min = "0")]
+pub fn next_frame(frame: Option<LispFrameRef>, miniframe: Option<LispObject>) -> LispFrameRef {
+    let frame = frame.unwrap_or_default();
+    if !frame.is_live() {
+        wrong_type!(Qframe_live_p, LispObject::from(frame));
+    }
+    return get_next_frame(frame, miniframe);
+}
+
+/// Return the previous frame in the frame list before FRAME.
+/// It only considers frames on the same terminal as FRAME.
+/// By default, skip minibuffer-only frames.
+/// If omitted, FRAME default to the selected frame.
+/// If optional argument MINIFRAME is `None', exclude minibuffer-only frames.
+/// If MINIFRAME is a window, include only its own frame
+/// and any frame now using that window as the minibuffer.
+/// If MINIFRAME is `visible', include all visible frames.
+/// If MINIFRAME is 0, include all visible and iconified frames.
+/// Otherwise, include all frames.
+#[lisp_fn(min = "0")]
+pub fn previous_frame(frame: Option<LispFrameRef>, miniframe: Option<LispObject>) -> LispFrameRef {
+    let frame = frame.unwrap_or_default();
+    if !frame.is_live() {
+        wrong_type!(Qframe_live_p, LispObject::from(frame));
+    }
+    return get_prev_frame(frame, miniframe).unwrap_or(frame);
+}
+
+pub fn frame_list() -> CarIter {
+    let list: LispObject = unsafe { Vframe_list };
+    return list.iter_cars();
+}
+
+/// Return the next frame in the frame list after FRAME.
+///
+/// Port of `next_frame' in  `frame.c'.
+fn get_next_frame(frame: LispFrameRef, minibuf: Option<LispObject>) -> LispFrameRef {
+    let mut passed = 0;
+    while passed < 2 {
+        for candidate in frame_list().map(|f| f.as_frame_or_error()) {
+            if passed > 0 {
+                if let Some(f) = candidate_frame(candidate, frame, minibuf) {
+                    return f;
+                }
+            }
+            if frame == candidate {
+                passed += 1;
+            }
+        }
+    }
+    return frame;
+}
+
+/// Look through the entire `frame_list' and return the last available frame
+fn get_prev_frame(frame: LispFrameRef, minibuf: Option<LispObject>) -> Option<LispFrameRef> {
+    let mut prev: Option<LispFrameRef> = None;
+    for candidate in frame_list().map(|f| f.as_frame_or_error()) {
+        if candidate == frame && prev.is_some() {
+            return prev;
+        }
+        prev = candidate_frame(candidate, frame, minibuf);
+    }
+    return prev;
+}
+
+/// Return CANDIDATE if it can be used as 'other-than-FRAME' from
+/// on the same tty (for tty frames) or among frames which use FRAME's
+/// keyboard.
+/// If MINIBUF is `visible', do not consider an invisible candidate.
+/// If MINIBUF is a window, consider only its own frame and candidate now
+/// using that window as the minibuffer.
+/// If MINIBUF is `None' consider `candidate' if it is visible or iconified.
+/// Otherwise consider any candidate and return `None' if CANDIDATE is not
+/// acceptable.
+fn candidate_frame(
+    candidate: LispFrameRef,
+    frame: LispFrameRef,
+    minibuf: Option<LispObject>,
+) -> Option<LispFrameRef> {
+    let candidate_type: FrameType = candidate.clone().into();
+    let frame_type: FrameType = frame.clone().into();
+    let candidate_terminal: Terminal = candidate.terminal();
+    let frame_terminal: Terminal = frame.terminal();
+    if (candidate_type != FrameType::Termcap && frame_type != FrameType::Termcap
+        && candidate_terminal.kboard() == frame_terminal.kboard())
+        || (candidate_type == FrameType::Termcap && frame_type == FrameType::Termcap
+            && candidate_terminal.tty() == frame_terminal.tty())
+    {
+        if unsafe { !get_frame_param(candidate.as_ptr(), Qno_other_frame).is_nil() } {
+            return None;
+        }
+
+        match minibuf {
+            Some(minibuf) => {
+                if minibuf == Qvisible && candidate.is_visible() {
+                    return Some(candidate);
+                } else if let Some(minibuf_window) = minibuf.as_window() {
+                    if candidate.minibuffer_window() == minibuf
+                        || minibuf_window.frame().as_frame_or_error() == candidate
+                        || minibuf_window.frame() == candidate.focus_frame()
+                    {
+                        return Some(candidate);
+                    }
+                } else if let Some(minibuf_num) = minibuf.as_fixnum() {
+                    if minibuf_num == 0 && candidate.is_visible() && candidate.is_iconified() {
+                        return Some(candidate);
+                    }
+                } else {
+                    return Some(candidate);
+                }
+            }
+            None => {
+                if candidate.is_minibuffer_only() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    return None;
 }
 
 include!(concat!(env!("OUT_DIR"), "/frames_exports.rs"));
